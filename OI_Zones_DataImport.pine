@@ -1,0 +1,435 @@
+//@version=5
+indicator("OI Zones - Data Import v5.1 [STABLE]", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ============================================================================
+// INPUTS - DATOS
+// ============================================================================
+
+// ============================================================================
+// INPUTS - DATOS
+// ============================================================================
+
+default_data_vertical = "strike,option_type,open_interest,volume\n5.0,call,1022,43\n5.0,put,0,0"
+data_input_vertical = input.text_area(defval=default_data_vertical, title="📊 DATA 1 (Cualquier Formato)", group="📥 DATA INPUT")
+
+default_data_horizontal = "Strike,CALL_Gamma,PUT_Gamma,CALL_OI,PUT_OI\n100.0,0.0,0.0,0,0"
+data_input_horizontal = input.text_area(defval=default_data_horizontal, title="📊 DATA 2 (Cualquier Formato)", group="📥 DATA INPUT")
+
+// ============================================================================
+// INPUTS - CONFIGURACIÓN
+// ============================================================================
+
+show_zones = input.bool(true, "Mostrar OI Zones", group="👁️ DISPLAY")
+zone_opacity = input.int(70, "Zone Opacity (%)", minval=0, maxval=100, group="👁️ DISPLAY")
+text_size_input = input.string("Small", "Tamaño Texto", options=["Tiny", "Small", "Normal"], group="👁️ DISPLAY")
+lookback_bars = input.int(150, "Ancho hacia atrás (Velas)", group="👁️ DISPLAY") 
+
+// ============================================================================
+// COLORES
+// ============================================================================
+
+CALL_BORDER = color.new(#ff3b3b, 0)      
+CALL_FILL = color.new(#ff3b3b, zone_opacity)
+PUT_BORDER = color.new(#00ff66, 0)       
+PUT_FILL = color.new(#00ff66, zone_opacity)
+TEXT_BG = color.new(#1e2329, 15)
+
+// ============================================================================
+// LOGICA DE PARSEO (SMART)
+// ============================================================================
+
+f_parse_csv_smart(csv_text) =>
+    lines = str.split(csv_text, "\n")
+    strikes_u = array.new<float>() 
+    call_ois_u = array.new<float>()
+    put_ois_u = array.new<float>()
+    
+    size = array.size(lines)
+    if size > 1
+        for i = 1 to size - 1
+            line = str.trim(array.get(lines, i))
+            if str.length(line) > 0 and str.contains(line, ",")
+                parts = str.split(line, ",")
+                p_size = array.size(parts)
+                float s_val = na
+                float oi_val = 0.0
+                string type_val = ""
+                
+                // FORMATO 1: strike,option_type,open_interest,volume (4+ columns)
+                // Detecta si la columna 2 tiene "call" o "put"
+                if p_size >= 3 and (str.contains(str.lower(array.get(parts, 1)), "call") or str.contains(str.lower(array.get(parts, 1)), "put"))
+                    s_val := str.tonumber(str.trim(array.get(parts, 0)))
+                    type_val := str.lower(str.trim(array.get(parts, 1)))
+                    oi_val := str.tonumber(str.trim(array.get(parts, 2)))
+                
+                // FORMATO 2: Strike,CALL_Gamma,PUT_Gamma,CALL_OI,PUT_OI (5 columns exacto)
+                // O Strike,X,Y,CALL_OI,PUT_OI
+                else if p_size == 5
+                    s_val := str.tonumber(str.trim(array.get(parts, 0)))
+                    call_oi_val = str.tonumber(str.trim(array.get(parts, 3)))
+                    put_oi_val = str.tonumber(str.trim(array.get(parts, 4)))
+                    if not na(s_val)
+                        array.push(strikes_u, s_val)
+                        array.push(call_ois_u, na(call_oi_val) ? 0 : call_oi_val)
+                        array.push(put_ois_u, na(put_oi_val) ? 0 : put_oi_val)
+                        s_val := na
+                
+                // FORMATO 3: Strike,CallOI,PutOI (3 columns)
+                else if p_size == 3
+                    s_val := str.tonumber(str.trim(array.get(parts, 0)))
+                    call_temp = str.tonumber(str.trim(array.get(parts, 1)))
+                    put_temp = str.tonumber(str.trim(array.get(parts, 2)))
+                    if not na(s_val)
+                        array.push(strikes_u, s_val)
+                        array.push(call_ois_u, na(call_temp) ? 0 : call_temp)
+                        array.push(put_ois_u, na(put_temp) ? 0 : put_temp)
+                        s_val := na
+                
+                // AGREGACIÓN para FORMATO 1 (vertical/largo)
+                if not na(s_val) and type_val != ""
+                    idx = array.indexof(strikes_u, s_val)
+                    if idx == -1
+                        array.push(strikes_u, s_val)
+                        array.push(call_ois_u, 0.0)
+                        array.push(put_ois_u, 0.0)
+                        idx := array.size(strikes_u) - 1
+                    
+                    if type_val == "call"
+                        array.set(call_ois_u, idx, array.get(call_ois_u, idx) + oi_val)
+                    else if type_val == "put"
+                        array.set(put_ois_u, idx, array.get(put_ois_u, idx) + oi_val)
+    
+    [strikes_u, call_ois_u, put_ois_u]
+
+f_find_clusters(oi_array) =>
+    if array.size(oi_array) == 0
+        [na, na, 0.0, 0.0]
+    else
+        var float max1 = 0.0
+        var float max2 = 0.0
+        var int idx1 = -1
+        var int idx2 = -1
+        max1 := 0.0
+        max2 := 0.0
+        idx1 := -1
+        idx2 := -1
+        for i = 0 to array.size(oi_array) - 1
+            val = array.get(oi_array, i)
+            if val > max1
+                max2 := max1
+                idx2 := idx1
+                max1 := val
+                idx1 := i
+            else if val > max2
+                max2 := val
+                idx2 := i
+        [idx1, idx2, max1, max2]
+
+// ============================================================================
+// MAX PAIN CALCULATION (Weighted by Gamma & OI)
+// ============================================================================
+
+f_calculate_max_pain(strikes, call_ois, put_ois, gamma_calls, gamma_puts) =>
+    // Max Pain = Strike donde se maximiza el "dolor" (pérdida teórica)
+    // Ponderado por: (OI_call + OI_put) * (gamma_call + gamma_put)
+    if array.size(strikes) == 0
+        [na, 0.0]
+    else
+        max_pain_idx = 0
+        max_pain_val = 0.0
+        
+        for i = 0 to array.size(strikes) - 1
+            oi_call = array.get(call_ois, i)
+            oi_put = array.get(put_ois, i)
+            
+            // Gamma weighting (si existen arrays de gamma, sino usar 1.0)
+            g_call = array.size(gamma_calls) > i ? array.get(gamma_calls, i) : 1.0
+            g_put = array.size(gamma_puts) > i ? array.get(gamma_puts, i) : 1.0
+            
+            // Métrica de dolor = (OI_total) * (gamma_total)
+            // Mientras más OI y gamma, más "dolor" en ese strike
+            pain_metric = (oi_call + oi_put) * (g_call + g_put)
+            
+            if pain_metric > max_pain_val
+                max_pain_val := pain_metric
+                max_pain_idx := i
+        
+        [array.get(strikes, max_pain_idx), max_pain_val]
+
+// ============================================================================
+// MAIN LOGIC (TIME BASED - FIXED)
+// ============================================================================
+
+var box call_box1 = na
+var box call_box2 = na
+var box put_box1 = na
+var box put_box2 = na
+var box call_box3 = na
+var box call_box4 = na
+var box put_box3 = na
+var box put_box4 = na
+var line max_pain_line = na
+var label lbl_call1 = na
+var label lbl_call2 = na
+var label lbl_put1 = na
+var label lbl_put2 = na
+var label lbl_call3 = na
+var label lbl_call4 = na
+var label lbl_put3 = na
+var label lbl_put4 = na
+var label lbl_max_pain = na
+
+sz = text_size_input == "Tiny" ? size.tiny : text_size_input == "Small" ? size.small : size.normal
+
+// --- CORRECCIÓN DE CÁLCULO DE TIEMPO ---
+int bar_duration = 0
+if bar_index > 0
+    bar_duration := (time - time[1])
+else
+    bar_duration := 3600000 
+
+// Proyección temporal
+int time_right = timenow + (bar_duration * 10) 
+int time_left = timenow - (bar_duration * lookback_bars)
+int label_x = time_right + (bar_duration * 2)
+
+// Procesar ambos inputs por separado
+[strikes1, call_ois1, put_ois1] = f_parse_csv_smart(data_input_vertical)
+[strikes2, call_ois2, put_ois2] = f_parse_csv_smart(data_input_horizontal)
+
+// ============================================================================
+// CÁLCULO DE MAX PAIN (ambos datasets)
+// ============================================================================
+
+[max_pain1, pain_val1] = f_calculate_max_pain(strikes1, call_ois1, put_ois1, array.new<float>(), array.new<float>())
+[max_pain2, pain_val2] = f_calculate_max_pain(strikes2, call_ois2, put_ois2, array.new<float>(), array.new<float>())
+
+// Seleccionar Max Pain más significativo (mayor valor de dolor)
+max_pain_final = na
+if not na(max_pain1) and not na(max_pain2)
+    max_pain_final := pain_val1 > pain_val2 ? max_pain1 : max_pain2
+else if not na(max_pain1)
+    max_pain_final := max_pain1
+else if not na(max_pain2)
+    max_pain_final := max_pain2
+
+// ============================================================================
+// VISUALIZAR MAX PAIN
+// ============================================================================
+
+if barstate.islast and not na(max_pain_final) and array.size(strikes1) > 0
+    if na(max_pain_line)
+        max_pain_line := line.new(time_left, max_pain_final, time_right, max_pain_final, 
+                                  xloc=xloc.bar_time, color=color.new(#ffb800, 0), width=3, style=line.style_dashed)
+    else
+        line.set_y1(max_pain_line, max_pain_final)
+        line.set_y2(max_pain_line, max_pain_final)
+        line.set_x1(max_pain_line, time_left)
+        line.set_x2(max_pain_line, time_right)
+    
+    label.delete(lbl_max_pain)
+    lbl_max_pain := label.new(label_x, max_pain_final, "MAX PAIN\n" + str.tostring(max_pain_final, "#.##"), 
+                             xloc=xloc.bar_time, style=label.style_label_left, 
+                             color=color.new(#ffb800, 0), textcolor=color.white, size=sz)
+
+// ============================================================================
+// DATA 1 - TOP 2 CLUSTERS
+// ============================================================================
+
+if array.size(strikes1) > 0
+    if barstate.islast
+        [call_idx1, call_idx2, call_max1, call_max2] = f_find_clusters(call_ois1)
+        [put_idx1, put_idx2, put_max1, put_max2] = f_find_clusters(put_ois1)
+        
+        // --- DATA1: CALL 1 ---
+        if call_idx1 >= 0
+            s1 = array.get(strikes1, call_idx1)
+            s2 = s1 + (s1 * 0.005)
+            if call_idx1 < array.size(strikes1) - 1
+                ns = array.get(strikes1, call_idx1 + 1)
+                if ns > s1
+                    s2 := ns
+            oi = array.get(call_ois1, call_idx1)
+            
+            if na(call_box1)
+                call_box1 := box.new(time_left, s1, time_right, s2, xloc=xloc.bar_time, 
+                                    border_color=CALL_BORDER, border_width=2, bgcolor=CALL_FILL)
+            else
+                box.set_left(call_box1, time_left)
+                box.set_right(call_box1, time_right)
+                box.set_top(call_box1, s2)
+                box.set_bottom(call_box1, s1)
+            
+            label.delete(lbl_call1)
+            lbl_call1 := label.new(label_x, (s1 + s2)/2, "D1-CALL\n" + str.tostring(oi, "#,##0"), 
+                                 xloc=xloc.bar_time, style=label.style_label_center, color=TEXT_BG, textcolor=color.white, size=sz)
+
+        // --- DATA1: CALL 2 ---
+        if call_idx2 >= 0
+            s1 = array.get(strikes1, call_idx2)
+            s2 = s1 + (s1 * 0.005)
+            if call_idx2 < array.size(strikes1) - 1
+                ns = array.get(strikes1, call_idx2 + 1)
+                if ns > s1
+                    s2 := ns
+            oi = array.get(call_ois1, call_idx2)
+            
+            if na(call_box2)
+                call_box2 := box.new(time_left, s1, time_right, s2, xloc=xloc.bar_time, 
+                                    border_color=CALL_BORDER, border_width=2, bgcolor=CALL_FILL)
+            else
+                box.set_left(call_box2, time_left)
+                box.set_right(call_box2, time_right)
+                box.set_top(call_box2, s2)
+                box.set_bottom(call_box2, s1)
+
+            label.delete(lbl_call2)
+            lbl_call2 := label.new(label_x, (s1 + s2)/2, "D1-CALL\n" + str.tostring(oi, "#,##0"), 
+                                 xloc=xloc.bar_time, style=label.style_label_center, color=TEXT_BG, textcolor=color.white, size=sz)
+
+        // --- DATA1: PUT 1 ---
+        if put_idx1 >= 0
+            s1 = array.get(strikes1, put_idx1)
+            s2 = s1 + (s1 * 0.005)
+            if put_idx1 < array.size(strikes1) - 1
+                ns = array.get(strikes1, put_idx1 + 1)
+                if ns > s1
+                    s2 := ns
+            oi = array.get(put_ois1, put_idx1)
+            
+            if na(put_box1)
+                put_box1 := box.new(time_left, s1, time_right, s2, xloc=xloc.bar_time, 
+                                   border_color=PUT_BORDER, border_width=2, bgcolor=PUT_FILL)
+            else
+                box.set_left(put_box1, time_left)
+                box.set_right(put_box1, time_right)
+                box.set_top(put_box1, s2)
+                box.set_bottom(put_box1, s1)
+
+            label.delete(lbl_put1)
+            lbl_put1 := label.new(label_x, (s1 + s2)/2, "D1-PUT\n" + str.tostring(oi, "#,##0"), 
+                                 xloc=xloc.bar_time, style=label.style_label_center, color=TEXT_BG, textcolor=color.white, size=sz)
+
+        // --- DATA1: PUT 2 ---
+        if put_idx2 >= 0
+            s1 = array.get(strikes1, put_idx2)
+            s2 = s1 + (s1 * 0.005)
+            if put_idx2 < array.size(strikes1) - 1
+                ns = array.get(strikes1, put_idx2 + 1)
+                if ns > s1
+                    s2 := ns
+            oi = array.get(put_ois1, put_idx2)
+            
+            if na(put_box2)
+                put_box2 := box.new(time_left, s1, time_right, s2, xloc=xloc.bar_time, 
+                                   border_color=PUT_BORDER, border_width=2, bgcolor=PUT_FILL)
+            else
+                box.set_left(put_box2, time_left)
+                box.set_right(put_box2, time_right)
+                box.set_top(put_box2, s2)
+                box.set_bottom(put_box2, s1)
+
+            label.delete(lbl_put2)
+            lbl_put2 := label.new(label_x, (s1 + s2)/2, "D1-PUT\n" + str.tostring(oi, "#,##0"), 
+                                 xloc=xloc.bar_time, style=label.style_label_center, color=TEXT_BG, textcolor=color.white, size=sz)
+
+// ============================================================================
+// DATA 2 - TOP 2 CLUSTERS
+// ============================================================================
+
+if array.size(strikes2) > 0
+    if barstate.islast
+        [call_idx3, call_idx4, call_max3, call_max4] = f_find_clusters(call_ois2)
+        [put_idx3, put_idx4, put_max3, put_max4] = f_find_clusters(put_ois2)
+        
+        // --- DATA2: CALL 3 ---
+        if call_idx3 >= 0
+            s1 = array.get(strikes2, call_idx3)
+            s2 = s1 + (s1 * 0.005)
+            if call_idx3 < array.size(strikes2) - 1
+                ns = array.get(strikes2, call_idx3 + 1)
+                if ns > s1
+                    s2 := ns
+            oi = array.get(call_ois2, call_idx3)
+            
+            if na(call_box3)
+                call_box3 := box.new(time_left, s1, time_right, s2, xloc=xloc.bar_time, 
+                                    border_color=CALL_BORDER, border_width=1, bgcolor=color.new(CALL_FILL, zone_opacity + 20))
+            else
+                box.set_left(call_box3, time_left)
+                box.set_right(call_box3, time_right)
+                box.set_top(call_box3, s2)
+                box.set_bottom(call_box3, s1)
+            
+            label.delete(lbl_call3)
+            lbl_call3 := label.new(label_x, (s1 + s2)/2, "D2-CALL\n" + str.tostring(oi, "#,##0"), 
+                                 xloc=xloc.bar_time, style=label.style_label_center, color=TEXT_BG, textcolor=color.white, size=sz)
+
+        // --- DATA2: CALL 4 ---
+        if call_idx4 >= 0
+            s1 = array.get(strikes2, call_idx4)
+            s2 = s1 + (s1 * 0.005)
+            if call_idx4 < array.size(strikes2) - 1
+                ns = array.get(strikes2, call_idx4 + 1)
+                if ns > s1
+                    s2 := ns
+            oi = array.get(call_ois2, call_idx4)
+            
+            if na(call_box4)
+                call_box4 := box.new(time_left, s1, time_right, s2, xloc=xloc.bar_time, 
+                                    border_color=CALL_BORDER, border_width=1, bgcolor=color.new(CALL_FILL, zone_opacity + 20))
+            else
+                box.set_left(call_box4, time_left)
+                box.set_right(call_box4, time_right)
+                box.set_top(call_box4, s2)
+                box.set_bottom(call_box4, s1)
+
+            label.delete(lbl_call4)
+            lbl_call4 := label.new(label_x, (s1 + s2)/2, "D2-CALL\n" + str.tostring(oi, "#,##0"), 
+                                 xloc=xloc.bar_time, style=label.style_label_center, color=TEXT_BG, textcolor=color.white, size=sz)
+
+        // --- DATA2: PUT 3 ---
+        if put_idx3 >= 0
+            s1 = array.get(strikes2, put_idx3)
+            s2 = s1 + (s1 * 0.005)
+            if put_idx3 < array.size(strikes2) - 1
+                ns = array.get(strikes2, put_idx3 + 1)
+                if ns > s1
+                    s2 := ns
+            oi = array.get(put_ois2, put_idx3)
+            
+            if na(put_box3)
+                put_box3 := box.new(time_left, s1, time_right, s2, xloc=xloc.bar_time, 
+                                   border_color=PUT_BORDER, border_width=1, bgcolor=color.new(PUT_FILL, zone_opacity + 20))
+            else
+                box.set_left(put_box3, time_left)
+                box.set_right(put_box3, time_right)
+                box.set_top(put_box3, s2)
+                box.set_bottom(put_box3, s1)
+
+            label.delete(lbl_put3)
+            lbl_put3 := label.new(label_x, (s1 + s2)/2, "D2-PUT\n" + str.tostring(oi, "#,##0"), 
+                                 xloc=xloc.bar_time, style=label.style_label_center, color=TEXT_BG, textcolor=color.white, size=sz)
+
+        // --- DATA2: PUT 4 ---
+        if put_idx4 >= 0
+            s1 = array.get(strikes2, put_idx4)
+            s2 = s1 + (s1 * 0.005)
+            if put_idx4 < array.size(strikes2) - 1
+                ns = array.get(strikes2, put_idx4 + 1)
+                if ns > s1
+                    s2 := ns
+            oi = array.get(put_ois2, put_idx4)
+            
+            if na(put_box4)
+                put_box4 := box.new(time_left, s1, time_right, s2, xloc=xloc.bar_time, 
+                                   border_color=PUT_BORDER, border_width=1, bgcolor=color.new(PUT_FILL, zone_opacity + 20))
+            else
+                box.set_left(put_box4, time_left)
+                box.set_right(put_box4, time_right)
+                box.set_top(put_box4, s2)
+                box.set_bottom(put_box4, s1)
+
+            label.delete(lbl_put4)
+            lbl_put4 := label.new(label_x, (s1 + s2)/2, "D2-PUT\n" + str.tostring(oi, "#,##0"), 
+                                 xloc=xloc.bar_time, style=label.style_label_center, color=TEXT_BG, textcolor=color.white, size=sz)
